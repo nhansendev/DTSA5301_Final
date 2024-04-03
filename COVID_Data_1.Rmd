@@ -1,0 +1,332 @@
+---
+title: "Final Project P2: COVID19 Analysis"
+output: html_document
+date: "2024-03-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+```
+
+This document describes some analysis methods and results for COVID19 data, which includes both global and US-specific datasets. 
+
+# Bias
+My primary concern with bias in this analysis is...
+
+# Data Import and Setup
+
+### Data Acquisition
+
+The COVID19 data for this analysis was supplied by John Hopkins University through their [GitHub](https://github.com/CSSEGISandData/COVID-19):
+```{r load_covid_data, cache=TRUE}
+base_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+files <- c("time_series_covid19_confirmed_US.csv",
+           "time_series_covid19_confirmed_global.csv",
+           "time_series_covid19_deaths_US.csv",
+           "time_series_covid19_deaths_global.csv")
+urls <- str_c(base_url, files)
+
+confirmed_US <- read_csv(urls[1], show_col_types = FALSE)
+confirmed_global <- read_csv(urls[2], show_col_types = FALSE)
+deaths_US <- read_csv(urls[3], show_col_types = FALSE)
+deaths_global <- read_csv(urls[4], show_col_types = FALSE)
+
+# US data includes population, but global population data must be retrieved separately
+global_population <- read_csv('https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv', show_col_types = FALSE)
+```
+
+### Data Cleaning
+
+Some key tasks when cleaning the data to make analysis easier:
+
+* Convert cases/deaths-per-date columns into new rows
+* Discard unused data, such as location coordinates
+* Standardize naming conventions
+* Convert dates to the date data-type
+
+Tidying and combining global data:
+```{r tidy_global_data, cache=TRUE}
+# Tidy global deaths
+tidy_deaths_global <- deaths_global %>%
+  pivot_longer(cols=-c("Province/State", 'Country/Region', Lat, Long), 
+               names_to='date', 
+               values_to='deaths') %>%
+  select(-c(Lat, Long))
+
+# Tidy global cases
+tidy_confirmed_global <- confirmed_global %>%
+  pivot_longer(cols=-c("Province/State", 'Country/Region', Lat, Long), 
+               names_to='date', 
+               values_to='cases') %>%
+  select(-c(Lat, Long))
+
+# Combine global cases and deaths datasets
+global_combined <- tidy_confirmed_global %>%
+  full_join(tidy_deaths_global, by = join_by(`Province/State`, `Country/Region`, date)) %>%
+  rename(Country_Region = 'Country/Region',
+         Province_State = 'Province/State') %>%
+  mutate(date = mdy(date)) %>%
+  filter(cases > 0)
+
+# Add population data
+global_combined <-  global_combined %>%
+  left_join(global_population, by=c("Province_State", "Country_Region")) %>%
+  select(-c(UID, FIPS)) %>%
+  select(Province_State, Country_Region, date, cases, deaths, Population, Combined_Key)
+```
+
+Tidying and combining US data:
+```{r tidy_US_data, cache=TRUE}
+# Tidy US cases
+tidy_US_cases <- confirmed_US %>%
+  pivot_longer(cols = -(UID:Combined_Key),
+               names_to='date',
+               values_to='cases') %>%
+  select(Admin2:cases) %>%
+  mutate(date=mdy(date)) %>%
+  select(-c(Lat, Long_)) %>%
+  rename(County = 'Admin2')
+
+# Tidy US deaths
+tidy_US_deaths <- deaths_US %>%
+  pivot_longer(cols = -(UID:Population),
+               names_to='date',
+               values_to='deaths') %>%
+  select(Admin2:deaths) %>%
+  mutate(date=mdy(date)) %>%
+  select(-c(Lat, Long_)) %>%
+  rename(County = 'Admin2')
+
+# Combine US cases and deaths
+US_combined <- tidy_US_cases %>%
+  full_join(tidy_US_deaths, by = join_by(County, Province_State, Country_Region, Combined_Key, date))%>%
+  filter(cases > 0)
+```
+
+### Helper Functions
+``` {r function_defs}
+# Min-max normalization
+normalize <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+
+# Data smoothing via moving average
+smoother <- function(data, L=10) {
+  c <- 1-1/L
+  d <- data/L
+  out <- numeric(length(data))
+  out[1] <- data[1]
+  for (i in 2:length(data)) {
+    out[i] <- out[i - 1]*c + d[i]
+  }
+  return(out)
+}
+```
+
+# Analysis
+
+(TODO, maybe remove)
+US data grouped by state over time:
+```{r group_US_data, cache=TRUE}
+US_by_state <- US_combined %>%
+  group_by(Province_State, Country_Region, date) %>%
+  summarize(cases=sum(cases),
+            deaths=sum(deaths),
+            Population=sum(Population), .groups='drop_last') %>%
+  mutate(deaths_per_mill = deaths*1000000/Population) %>%
+  select(Province_State, Country_Region, date, cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+```
+
+First, let's summarize the US data and plot cases and deaths over time:
+```{r visualize_total_US_data}
+# Summarize US data
+US_totals <- US_combined %>%
+  group_by(Country_Region, date) %>%
+  summarize(cases=sum(cases),
+            deaths=sum(deaths),
+            Population=sum(Population), .groups='drop_last') %>%
+  mutate(deaths_per_mill = deaths*1000000/Population) %>%
+  select(Country_Region, date, cases, deaths, deaths_per_mill, Population) %>%
+  ungroup() %>%
+  mutate(new_cases=cases-lag(cases),
+         new_deaths=deaths-lag(deaths))
+
+# A data index to reference when adding labels
+idx <- length(US_totals$date)%/%1.3
+idx2 <- length(US_totals$date)%/%1.55
+
+# Cumulative plot
+plotA <- US_totals %>%
+  ggplot(aes(x=date, y=cases)) +
+  geom_line(color='blue', linewidth=1)+
+  geom_text(x=US_totals$date[idx], y=US_totals$cases[idx], label='Cases', hjust=0, vjust=1)+
+  geom_line(aes(y=deaths*100), color='red', linewidth=1)+
+  geom_text(x=US_totals$date[idx], y=US_totals$deaths[idx]*100, label='Deaths', hjust=1, vjust=-0.3)+
+  scale_y_continuous(
+    name = "Cumulative Cases",
+    labels=scales::comma,
+    sec.axis = sec_axis(~./100, name="Cumulative Deaths", labels=scales::comma))+
+  labs(title=expression('Cumulative Cases/Deaths for COVID19 in US '["(note different Y scales)"]), x='Date')+
+  theme(axis.title.y.left=element_text(color='blue'),
+        axis.title.y.right=element_text(color='red'))
+
+# Differences plot
+plotB <- US_totals %>%
+  filter(!is.na(new_cases)) %>%
+  ggplot(aes(x=date, y=smoother(new_cases))) +
+  geom_line(color='blue', linewidth=1)+
+  geom_line(aes(y=smoother(new_deaths)*100), color='red', linewidth=1)+
+  geom_text(x=US_totals$date[idx2], y=US_totals$new_cases[idx2], label='Cases', hjust=-0.1, vjust=0)+
+  geom_text(x=US_totals$date[idx2], y=US_totals$new_deaths[idx2]*100, label='Deaths', hjust=-0.2, vjust=0)+
+  scale_y_continuous(
+    name = "New Cases",
+    labels=scales::comma,
+    sec.axis = sec_axis(~./100, name="New Deaths", labels=scales::comma))+
+  labs(title=expression('New Cases/Deaths for COVID19 in US '["(note different Y scales)"]), x='Date')+
+  theme(axis.title.y.left=element_text(color='blue'),
+        axis.title.y.right=element_text(color='red'))
+
+# Stack the two plots
+plotA/plotB
+```
+
+From this plot we can see that there was a roughly linear trend for both deaths and cases over time, with similar shapes for both. Intuitively the similarities between the two makes sense if we assume that someone must first catch COVID19 to die from it. We also see that the upticks in deaths follow the upticks in cases with a short delay, which also makes sense intuitively since it takes time for the virus to kill its host.
+
+Since we have data for both the US individually and included with the global data we can compare both sources to check for agreement:
+``` {r global_us_summary}
+
+global_US <- global_combined %>%
+  filter(Country_Region=="US") %>%
+  group_by(Country_Region, date) %>%
+  summarize(cases=sum(cases),
+            deaths=sum(deaths),
+            Population=sum(Population), .groups='drop_last') %>%
+  mutate(deaths_per_mill = deaths*1000000/Population) %>%
+  select(Country_Region, date, cases, deaths, deaths_per_mill, Population) %>%
+  ungroup() %>%
+  mutate(new_cases=cases-lag(cases),
+         new_deaths=deaths-lag(deaths))
+
+# The data index to reference when adding labels
+idx <- length(US_totals$date)%/%2
+idx2 <- length(US_totals$date)%/%1.7
+
+US_totals %>%
+  ggplot(aes(x=date, y=cases)) +
+  
+  # Cases
+  geom_line(color='blue')+
+  geom_line(data=global_US, mapping=aes(x=date, y=cases), color='orange')+
+  geom_text(x=US_totals$date[idx], y=US_totals$cases[idx], label='Cases, US', hjust=0, vjust=1, color='blue')+
+  geom_text(x=US_totals$date[idx2], y=US_totals$cases[idx2], label='Cases, Global US', hjust=0, vjust=1, color='orange')+
+  
+  # Deaths
+  geom_line(aes(y=deaths*100), color='red')+
+  geom_line(data=global_US, mapping=aes(x=date, y=deaths*100), color='green')+
+  geom_text(x=US_totals$date[idx], y=US_totals$deaths[idx]*100, label='Deaths, US', hjust=1, vjust=0, color='red')+
+  geom_text(x=US_totals$date[idx2], y=US_totals$deaths[idx2]*100, label='Deaths, Global US', hjust=1, vjust=0, color='green')+
+  
+  scale_y_continuous(
+    name = "Cumulative Cases",
+    labels=scales::comma,
+    sec.axis = sec_axis(~./100, name="Cumulative Deaths", labels=scales::comma))+
+  labs(title=expression('Cumulative Totals for US data by Source '["(note different Y scales)"]), x='Date')+
+  theme(axis.title.y.left=element_text(color='blue'),
+        axis.title.y.right=element_text(color='red'))
+
+```
+
+As expected, the datasets are closely matched. 
+
+``` {r monthly_us_totals}
+# Some common US holidays/observances
+holiday_dates <- tibble(days=yday(mdy(c("01/01/2024", "05/27/2024", "07/04/2024", "09/02/2024", "10/31/2024", "11/28/2024", "12/25/2024"))), 
+                        names=c("New Years", "Memorial Day", "Independence Day", "Labor Day", "Halloween", "Thanksgiving", "Christmas"))
+
+# Prepare data for plotting by year/month/etc.
+yearly_us_totals <- US_totals %>%
+  filter(!is.na(new_cases)) %>%
+  mutate(day=day(date),
+         yday=yday(date),
+         month=factor(month(date)),
+         year=factor(year(date)))
+
+offset_date <- as.Date("2019-12-31") # for plotting yearly
+
+# Plot the new cases over time by year, with US holidays marked
+yearly_us_totals %>%
+  ggplot(aes(x=offset_date+yday, y=smoother(new_cases)))+
+  scale_x_date(date_breaks="1 month", date_labels="%b")+
+  geom_line(aes(color=year), linewidth=1.25)+
+  geom_vline(data=holiday_dates, aes(xintercept=offset_date+days))+
+  geom_text(data=holiday_dates, aes(x=offset_date+days, label=names), y=max(smoother(yearly_us_totals$new_cases)), angle=90, vjust=1, hjust=1, alpha=0.5)+
+  labs(title='New US Cases per Year', x="Month", y='New Cases', color='Year')
+
+# Plot the new deaths over time by year
+yearly_us_totals %>%
+  ggplot(aes(x=offset_date+yday, y=smoother(new_deaths)))+
+  scale_x_date(date_breaks="1 month", date_labels="%b")+
+  geom_line(aes(color=year), linewidth=1.25)+
+  labs(title='New US Deaths per Year', x="Month", y='New Deaths', color='Year')
+
+```
+
+``` {r daily_us_totals}
+
+us_totals_daily <- yearly_us_totals %>%
+  group_by(day, month) %>%
+  summarize(totals=sum(new_cases), .groups='drop_last')
+
+monthly_maxs <- us_totals_daily %>%
+  group_by(month) %>%
+  summarize(max_totals=max(totals))
+
+us_totals_daily <- us_totals_daily %>%
+  full_join(monthly_maxs, by = join_by(month)) %>%
+  mutate(norm_totals=totals/max_totals)
+
+us_totals_daily %>%
+  ggplot(aes(x=day))+
+  geom_line(aes(y=totals, color=month))
+
+us_totals_daily %>%
+  ggplot(aes(x=day))+
+  geom_line(aes(y=norm_totals, color=month))
+
+```
+
+```{r visualize_state_US_data}
+state <- 'New York'
+US_by_state %>%
+  filter(Province_State == state) %>%
+  #filter(cases>0, deaths > 0) %>%
+  mutate(deaths=ifelse(deaths > 0, deaths, 1)) %>%
+  ggplot(aes(x=date, y=cases)) +
+  geom_line(aes(color='cases'))+
+  geom_point(aes(color='cases'))+
+  geom_line(aes(y=deaths, color='deaths'))+
+  geom_point(aes(y=deaths, color='deaths'))+
+  scale_y_log10()+
+  theme(legend.position='bottom',
+    axis.text.x=element_text(angle=90))+
+  labs(title=str_c('COVID19 in', state), y=NULL)
+
+```
+
+```{r add_change_US_data}
+US_by_state <- US_by_state %>%
+  mutate(new_cases=cases-lag(cases),
+         new_deaths=deaths-lag(deaths))
+US_totals <- US_totals %>%
+  mutate(new_cases=cases-lag(cases),
+         new_deaths=deaths-lag(deaths))
+
+```
+
+
+

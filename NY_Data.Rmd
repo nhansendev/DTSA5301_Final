@@ -1,0 +1,165 @@
+---
+title: "Final Project Part 1: New York Shooting Data"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-03-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=10, fig.height=6)
+
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+```
+
+This document describes New York shooting incident data analysis performed as part of the DTSA-5301 final project.
+
+# Bias
+My primary concern with personal bias in this analysis is that I could try to explain occurrences using some irrelevant assumptions about the individuals involved in the shootings. I have tried to remain as objective and neutral as possible by offering explanations that apply to the population in general instead of focusing on particular sub-groups, except where relevant for the analysis (e.g. age).
+
+Another possible source of bias is the methods by which the data was gathered, such as (intentionally or otherwise) intimidating witnesses, or using leading questions. Time of day may also affect data gathering since there are likely fewer witnesses at night (and fewer fully awake), which is also the time of day when the most shootings are recorded. The willingness of witnesses to provide testimony may also be a source of bias if they believe that their lives may be in danger by doing so.
+
+The sample sizes are also of some concern as analyses are more easily biased by outliers in smaller groups.
+
+# Analysis
+
+First, we must load the shooting data from the City of New York website:
+```{r load_data, cache=TRUE}
+shooting_data <- read_csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD", show_col_types = FALSE)
+```
+
+Next we can do some quick tidying of the data to eliminate columns that we're not interested in and change the occurrence dates to a date type. We can further filter the data to remove some entries that are most likely mistakes (no one lives to 1020 years old, for example):
+```{r tidy_data, cache=TRUE}
+tidy_shooting_data <- shooting_data %>%
+  select(-c(INCIDENT_KEY, X_COORD_CD, Y_COORD_CD, Latitude, Longitude, Lon_Lat)) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE),
+         PERP_AGE_GROUP = replace_na(PERP_AGE_GROUP, 'NA'),
+         PERP_AGE_GROUP = recode(PERP_AGE_GROUP, '(null)'="NA")) %>%
+  filter(!(PERP_AGE_GROUP %in% c('1020', '224', '940'))) %>%
+  filter(!(VIC_AGE_GROUP %in% c('1022')))
+```
+
+### Perp vs Victim by Age
+
+Let's say we want to know what the most likely pairings of shooter (perp) and victim (vic) are by age group. If we (temporarily) ignore the cases where we don't know both ages we get the plot shown below:
+```{r group_data_by_age}
+age_group_data <- tidy_shooting_data %>%
+  filter(!(PERP_AGE_GROUP %in% c('UNKNOWN', 'NA'))) %>%
+  filter(VIC_AGE_GROUP != 'UNKNOWN') %>%
+  group_by(PERP_AGE_GROUP, VIC_AGE_GROUP) %>%
+  summarize(count=n(), by='PERP_AGE_GROUP', .groups='keep')
+
+age_group_data %>%
+  ggplot(aes(x=PERP_AGE_GROUP, y=VIC_AGE_GROUP))+
+  geom_point(aes(size=count))+
+  labs(title='Shooting Victim Age vs Perp Age', x="Perp Age Group", y='Victim Age Group', size='Count')
+```
+
+From the plot we can see an approximate symmetry about the diagonal, suggesting that age groups are likely to target each-other symmetrically. We can also see that the majority of shootings involve individuals between 18 and 44, which intuitively makes sense as we would expect particularly young or old individuals to be less likely to engage in violent behavior of this magnitude (less physically capable, less access to firearms, etc). 
+
+Next, we can add back in the data that was previously ignored: when either age group is unknown, or not applicable (NA). We can also calculate percentages at the same time for easier comparison:
+```{r group_data_by_age_with_unknowns}
+
+age_group_data_unknown <- tidy_shooting_data %>%
+  group_by(PERP_AGE_GROUP, VIC_AGE_GROUP) %>%
+  summarize(count=n(), .groups='keep') %>%
+  mutate(perp=case_when(PERP_AGE_GROUP == 'UNKNOWN' ~ 'Unknown', PERP_AGE_GROUP == 'NA' ~ 'NA'),
+         perp=replace_na(perp, 'Known')) 
+
+age_group_pct <- age_group_data_unknown %>%
+  group_by(VIC_AGE_GROUP, perp) %>%
+  summarize(total=sum(count), .groups='keep') %>%
+  group_by(perp) %>%
+  mutate(pct=total/sum(total))
+```
+
+A similar plot as before can be generated with the newly added data represented by red squares:
+```{r visualize_age_data_w_unknowns}
+groups = c('UNKNOWN', 'NA')
+filtered_dataA <- age_group_data_unknown %>%
+  filter(!(PERP_AGE_GROUP %in% groups | VIC_AGE_GROUP %in% groups))
+
+filtered_dataB <- age_group_data_unknown %>%
+  filter(PERP_AGE_GROUP %in% groups | VIC_AGE_GROUP %in% groups)
+
+filtered_dataA %>%
+  ggplot(aes(x=PERP_AGE_GROUP, y=VIC_AGE_GROUP))+
+  geom_point(aes(size=count), show.legend=FALSE)+
+  geom_point(data=filtered_dataB, aes(x=PERP_AGE_GROUP, y=VIC_AGE_GROUP, size=count), fill='red', color='red', shape=22)+
+  labs(title='Shooting Victim Age vs Perp Age with Unknowns', x='Perp Age Group', y='Victim Age Group', size='Count')
+```
+
+We can see that the distribution of the new data is similar, but it's not easy to compare in this format. Instead, we'll generate another plot using the percentages calculated earlier:
+```{r visualize_age_data_w_unknowns_pct}
+age_group_pct %>%
+  ggplot(aes(x=VIC_AGE_GROUP, y=pct))+
+    geom_bar(aes(fill=perp), stat='identity', position='dodge')+
+    scale_y_continuous(labels=scales::percent)+
+    labs(title='Shooting Victim Age Distributions', x='Victim Age Group', y='', fill='Perp Age')
+```
+
+Using this plot it's much easier to tell that victim age groups have similar distributions regardless of whether we know the perp's age. There does appear to be a small shift in the data so that the mean of the Unknown group is lower than the others. This might suggest that the younger shooters are better at evading identification, or capture, which would intuitively make sense if we assume that younger individuals are typically more physically capable. 
+
+### Cumulative Shootings by Perp Age over Time
+
+What about shootings over time? Let's arbitrarily select one age group (<18) and group the data by date, then generate a cumulative sum, and a linear model to approximate the data:
+```{r group_18_over_time}
+perp_18_time_group <- tidy_shooting_data %>%
+  filter(PERP_AGE_GROUP == '<18') %>%
+  group_by(PERP_AGE_GROUP, OCCUR_DATE) %>%
+  summarize(count=n(), .groups='drop_last') %>%
+  ungroup() %>%
+  select(OCCUR_DATE, count) %>%
+  arrange(OCCUR_DATE) %>%
+  mutate(csum = cumsum(count))
+
+age_model <- lm(csum ~ OCCUR_DATE, data=perp_18_time_group)
+perp_18_time_group <- perp_18_time_group %>%
+  mutate(pred=predict(age_model))
+
+summary(age_model)
+```
+
+We can then use the data and model to compare the total instances of shooters in the <18 age group over time:
+```{r visualize_18_over_time}
+colors <- c('Data' = 'blue', 'Model' = 'red')
+
+perp_18_time_group %>%
+  ggplot(aes(x=OCCUR_DATE))+
+  geom_line(aes(y=csum, color='Data'), linewidth=1.5)+
+  geom_line(aes(y=pred, color='Model'), linewidth=1.5)+
+  labs(title='Cumulative Shooting Perp <18 over Time', x="Date", y='Cumulative Total', color='Legend')+
+  scale_color_manual(values = colors)
+```
+
+The plot shows us that there is an approximately linear trend, suggesting that the rate of shooters in the <18 group is approximately constant over time. This may be contrary to expectations, since there are many factors (changes in populations, laws, cultural values, the overall economy, access to firearms, etc.), that might affect the prevalence of shootings in New York. It seems likely that the 16 years of data (2006-2022) simply don't represent a long-enough time-span to observe more obvious deviations. 
+
+We can do the same for all groups, including cases where the shooter age is unknown or not applicable:
+```{r group_age_over_time}
+perp_age_time_group <- tidy_shooting_data %>%
+  group_by(PERP_AGE_GROUP, OCCUR_DATE) %>%
+  summarize(count=n(), .groups='drop_last') %>%
+  arrange(OCCUR_DATE) %>%
+  mutate(csum = cumsum(count)) %>%
+  mutate(norm_csum = csum/max(csum))
+
+plotA <- perp_age_time_group %>%
+  ggplot(aes(x=OCCUR_DATE))+
+  geom_line(aes(y=csum, color=PERP_AGE_GROUP), linewidth=1.5)+
+  labs(title='Cumulative Shootings by Perp Age over Time', x="Date", y='Cumulative Total', color='Perp Age')+
+  theme(legend.position = 'none')
+
+plotB <- perp_age_time_group %>%
+  ggplot(aes(x=OCCUR_DATE))+
+  geom_line(aes(y=norm_csum, color=PERP_AGE_GROUP), linewidth=1.5)+
+  labs(title='Normalized Cumulative Shootings by Perp Age over Time', x="Date", y='Normalized Cumulative Total', color='Perp Age')
+
+plotA+plotB
+```
+
+From these plots we can see that there is an approximately linear trend for each group except "Unknown", which suddenly falls-off after 2010 and has no entries after 2020. This might be explained by a change in how cases were recorded, or reported. For example, we can see that the NA category has a sudden increase in slope at the same time as the Unknown category tapers-off, suggesting that this may simply be how the information was re-categorized. 
+
+Another noteworthy trend is the very close overlap of the normalized <18 and 18-24 groups. I assume that most shooters in <18 are probably on the high end of that range, so it could make sense that their behaviors are similar. We can also observe that the 18-24 group has a much narrower age-range than the other groups (six years vs ~20), despite being associated with the most shootings.
+
